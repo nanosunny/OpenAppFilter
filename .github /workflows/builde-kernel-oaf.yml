@@ -1,0 +1,107 @@
+# .github/workflows/build-kernel-oaf.yml  
+name: Build rockchip kernel 6.18 (boot+dtb+modules) with OAF  
+  
+on:  
+  workflow_dispatch:  
+    inputs:  
+      kernel_ref:  
+        description: 'kagaminehaku/linux-6.18.y 的分支或 tag'  
+        required: false  
+        default: 'main'  
+      kernel_localversion:  
+        description: 'LOCALVERSION 后缀 (需与目标固件 uname -r 一致)'  
+        required: false  
+        default: '-oaf'  
+  
+env:  
+  ARCH: arm64  
+  CROSS: aarch64-linux-gnu-  
+  
+jobs:  
+  build:  
+    runs-on: ubuntu-latest  
+    steps:  
+      - uses: actions/checkout@v4  
+        with:  
+          path: OpenAppFilter  
+  
+      - name: Install toolchain & deps  
+        run: |  
+          sudo apt-get update  
+          sudo apt-get install -y gcc-aarch64-linux-gnu bc bison flex \  
+            libssl-dev libelf-dev rsync device-tree-compiler u-boot-tools \  
+            dwarves pahole cpio kmod  
+  
+      - name: Clone kagaminehaku/linux-6.18.y  
+        run: |  
+          git clone --depth=1 -b ${{ inputs.kernel_ref }} \  
+            https://github.com/kagaminehaku/linux-6.18.y.git kernel  
+  
+      - name: Configure kernel  
+        run: |  
+          cd kernel  
+          # 优先使用仓库自带的 rockchip defconfig；没有则回退 ophub config  
+          if ls arch/arm64/configs/*rockchip*defconfig >/dev/null 2>&1; then  
+            make ARCH=$ARCH CROSS_COMPILE=$CROSS \  
+              $(ls arch/arm64/configs/ | grep -i rockchip | head -n1)  
+          elif [ -f arch/arm64/configs/defconfig ]; then  
+            make ARCH=$ARCH CROSS_COMPILE=$CROSS defconfig  
+          else  
+            curl -L -o .config \  
+              "https://raw.githubusercontent.com/ophub/kernel/main/kernel-config/release/general/config-6.18" || true  
+            make ARCH=$ARCH CROSS_COMPILE=$CROSS olddefconfig  
+          fi  
+          scripts/config --set-str CONFIG_LOCALVERSION "${{ inputs.kernel_localversion }}"  
+          # oaf 依赖 conntrack/netfilter（kmod-oaf DEPENDS +kmod-ipt-conntrack）  
+          scripts/config -e CONFIG_NF_CONNTRACK -e CONFIG_NETFILTER \  
+                         -e CONFIG_IP_NF_IPTABLES -e CONFIG_NF_CONNTRACK_MARK || true  
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS olddefconfig modules_prepare  
+  
+      - name: Build kernel Image + dtbs + modules  
+        run: |  
+          make -C kernel -j$(nproc) ARCH=$ARCH CROSS_COMPILE=$CROSS Image dtbs modules  
+  
+      - name: Build oaf.ko against same tree  
+        run: |  
+          cd OpenAppFilter/oaf/src  
+          make -C "$GITHUB_WORKSPACE/kernel" M=$PWD \  
+               ARCH=$ARCH CROSS_COMPILE=$CROSS \  
+               EXTRA_CFLAGS="-Wno-declaration-after-statement -Wno-strict-prototypes -Wno-unused-variable -Wno-implicit-fallthrough -Wno-missing-braces -Wno-parentheses -Wno-format -Wno-missing-prototypes -Wno-missing-declarations" \  
+               modules  
+          ${CROSS}strip --strip-unneeded oaf.ko  
+          modinfo oaf.ko | grep -E 'vermagic|filename'  
+  
+      - name: Package boot / dtb / modules  
+        run: |  
+          KREL=$(make -s -C kernel ARCH=$ARCH kernelrelease)  
+          echo "KREL=$KREL" >> $GITHUB_ENV  
+          mkdir -p pkg/modules pkg/boot pkg/dtb  
+  
+          make -C kernel ARCH=$ARCH CROSS_COMPILE=$CROSS \  
+            INSTALL_MOD_PATH=$GITHUB_WORKSPACE/pkg/modules modules_install  
+          cp OpenAppFilter/oaf/src/oaf.ko pkg/modules/lib/modules/$KREL/  
+          depmod -b pkg/modules $KREL  
+          tar -czf modules.tar.gz -C pkg/modules lib  
+  
+          cp kernel/arch/arm64/boot/Image pkg/boot/  
+          tar -czf boot.tar.gz -C pkg/boot .  
+  
+          cp kernel/arch/arm64/boot/dts/rockchip/*.dtb pkg/dtb/  
+          tar -czf dtb-rockchip.tar.gz -C pkg/dtb .  
+  
+      - uses: actions/upload-artifact@v4  
+        with:  
+          name: kernel-${{ env.KREL }}-rockchip  
+          path: |  
+            boot.tar.gz  
+            dtb-rockchip.tar.gz  
+            modules.tar.gz  
+  
+      - name: Release  
+        if: startsWith(github.ref, 'refs/tags/')  
+        uses: softprops/action-gh-release@v2  
+        with:  
+          files: |  
+            boot.tar.gz  
+            dtb-rockchip.tar.gz  
+            modules.tar.gz
